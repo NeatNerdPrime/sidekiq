@@ -16,6 +16,7 @@ describe 'API' do
       assert_equal 0, s.failed
       assert_equal 0, s.enqueued
       assert_equal 0, s.default_queue_latency
+      assert_equal 0, s.workers_size
     end
 
     describe "processed" do
@@ -68,6 +69,19 @@ describe 'API' do
         s = Sidekiq::Stats.new
         assert_equal 0, s.failed
         assert_equal 5, s.processed
+      end
+    end
+
+    describe "workers_size" do
+      it 'retrieves the number of busy workers' do
+        Sidekiq.redis do |c|
+          c.sadd("processes", "process_1")
+          c.sadd("processes", "process_2")
+          c.hset("process_1", "busy", 1)
+          c.hset("process_2", "busy", 2)
+        end
+        s = Sidekiq::Stats.new
+        assert_equal 3, s.workers_size
       end
     end
 
@@ -540,6 +554,7 @@ describe 'API' do
         'key' => identity_string,
         'identity' => identity_string,
         'started_at' => Time.now.to_f - 15,
+        'queues' => ['foo', 'bar']
       }
 
       time = Time.now.to_f
@@ -557,6 +572,7 @@ describe 'API' do
       assert_equal 10, data['busy']
       assert_equal time, data['beat']
       assert_equal 123, data['pid']
+      assert_equal ['foo', 'bar'], data.queues
       data.quiet!
       data.stop!
       signals_string = "#{odata['key']}-signals"

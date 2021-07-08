@@ -10,14 +10,13 @@ module Sidekiq
   module WebHelpers
     def strings(lang)
       @strings ||= {}
-      @strings[lang] ||= begin
-        # Allow sidekiq-web extensions to add locale paths
-        # so extensions can be localized
-        settings.locales.each_with_object({}) do |path, global|
-          find_locale_files(lang).each do |file|
-            strs = YAML.load(File.open(file))
-            global.merge!(strs[lang])
-          end
+
+      # Allow sidekiq-web extensions to add locale paths
+      # so extensions can be localized
+      @strings[lang] ||= settings.locales.each_with_object({}) do |path, global|
+        find_locale_files(lang).each do |file|
+          strs = YAML.load(File.open(file))
+          global.merge!(strs[lang])
         end
       end
     end
@@ -126,7 +125,7 @@ module Sidekiq
     # within is used by Sidekiq Pro
     def display_tags(job, within = nil)
       job.tags.map { |tag|
-        "<span class='jobtag label label-info'>#{::Rack::Utils.escape_html(tag)}</span>"
+        "<span class='label label-info jobtag'>#{::Rack::Utils.escape_html(tag)}</span>"
       }.join(" ")
     end
 

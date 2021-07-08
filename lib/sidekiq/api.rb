@@ -8,7 +8,7 @@ require "base64"
 module Sidekiq
   class Stats
     def initialize
-      fetch_stats!
+      fetch_stats_fast!
     end
 
     def processed
@@ -51,7 +51,8 @@ module Sidekiq
       Sidekiq::Stats::Queues.new.lengths
     end
 
-    def fetch_stats!
+    # O(1) redis calls
+    def fetch_stats_fast!
       pipe1_res = Sidekiq.redis { |conn|
         conn.pipelined do
           conn.get("stat:processed")
@@ -64,6 +65,33 @@ module Sidekiq
         end
       }
 
+      default_queue_latency = if (entry = pipe1_res[6].first)
+        job = begin
+          Sidekiq.load_json(entry)
+        rescue
+          {}
+        end
+        now = Time.now.to_f
+        thence = job["enqueued_at"] || now
+        now - thence
+      else
+        0
+      end
+
+      @stats = {
+        processed: pipe1_res[0].to_i,
+        failed: pipe1_res[1].to_i,
+        scheduled_size: pipe1_res[2],
+        retry_size: pipe1_res[3],
+        dead_size: pipe1_res[4],
+        processes_size: pipe1_res[5],
+
+        default_queue_latency: default_queue_latency
+      }
+    end
+
+    # O(number of processes + number of queues) redis calls
+    def fetch_stats_slow!
       processes = Sidekiq.redis { |conn|
         conn.sscan_each("processes").to_a
       }
@@ -83,30 +111,13 @@ module Sidekiq
       workers_size = pipe2_res[0...s].sum(&:to_i)
       enqueued = pipe2_res[s..-1].sum(&:to_i)
 
-      default_queue_latency = if (entry = pipe1_res[6].first)
-        job = begin
-          Sidekiq.load_json(entry)
-        rescue
-          {}
-        end
-        now = Time.now.to_f
-        thence = job["enqueued_at"] || now
-        now - thence
-      else
-        0
-      end
-      @stats = {
-        processed: pipe1_res[0].to_i,
-        failed: pipe1_res[1].to_i,
-        scheduled_size: pipe1_res[2],
-        retry_size: pipe1_res[3],
-        dead_size: pipe1_res[4],
-        processes_size: pipe1_res[5],
+      @stats[:workers_size] = workers_size
+      @stats[:enqueued] = enqueued
+    end
 
-        default_queue_latency: default_queue_latency,
-        workers_size: workers_size,
-        enqueued: enqueued
-      }
+    def fetch_stats!
+      fetch_stats_fast!
+      fetch_stats_slow!
     end
 
     def reset(*stats)
@@ -126,7 +137,8 @@ module Sidekiq
     private
 
     def stat(s)
-      @stats[s]
+      fetch_stats_slow! if @stats[s].nil?
+      @stats[s] || raise(ArgumentError, "Unknown stat #{s}")
     end
 
     class Queues
@@ -141,7 +153,7 @@ module Sidekiq
           }
 
           array_of_arrays = queues.zip(lengths).sort_by { |_, size| -size }
-          Hash[array_of_arrays]
+          array_of_arrays.to_h
         end
       end
     end
@@ -316,21 +328,23 @@ module Sidekiq
 
     def display_class
       # Unwrap known wrappers so they show up in a human-friendly manner in the Web UI
-      @klass ||= case klass
-                 when /\ASidekiq::Extensions::Delayed/
-                   safe_load(args[0], klass) do |target, method, _|
-                     "#{target}.#{method}"
-                   end
-                 when "ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper"
-                   job_class = @item["wrapped"] || args[0]
-                   if job_class == "ActionMailer::DeliveryJob" || job_class == "ActionMailer::MailDeliveryJob"
-                     # MailerClass#mailer_method
-                     args[0]["arguments"][0..1].join("#")
-                   else
-                     job_class
-                   end
-                 else
-                   klass
+      @klass ||= self["display_class"] || begin
+        case klass
+        when /\ASidekiq::Extensions::Delayed/
+          safe_load(args[0], klass) do |target, method, _|
+            "#{target}.#{method}"
+          end
+        when "ActiveJob::QueueAdapters::SidekiqAdapter::JobWrapper"
+          job_class = @item["wrapped"] || args[0]
+          if job_class == "ActionMailer::DeliveryJob" || job_class == "ActionMailer::MailDeliveryJob"
+            # MailerClass#mailer_method
+            args[0]["arguments"][0..1].join("#")
+          else
+            job_class
+          end
+        else
+          klass
+        end
       end
     end
 
@@ -880,6 +894,10 @@ module Sidekiq
       self["identity"]
     end
 
+    def queues
+      self["queues"]
+    end
+
     def quiet!
       signal("TSTP")
     end
@@ -910,7 +928,7 @@ module Sidekiq
   end
 
   ##
-  # The WorkSet is stores the work being done by this Sidekiq cluster.
+  # The WorkSet stores the work being done by this Sidekiq cluster.
   # It tracks the process and thread working on each job.
   #
   # WARNING WARNING WARNING
